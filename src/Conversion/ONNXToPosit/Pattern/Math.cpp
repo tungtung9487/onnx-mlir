@@ -1123,54 +1123,70 @@ static const GP8BuildTimeTable &getGP8BuildTimeTableCustom(int rs, int sc) {
   return inserted->second;
 }
 
+// Round x to the nearest value in a PREBUILT GP8 table (binary search only, no
+// table fetch/lock). The const-ALPS weight search fetches the table once per
+// (rs,sc) candidate and calls this per weight; the old code re-entered the
+// mutex-locked table cache on EVERY element, so with POSIT_CONST_ALPS_JOBS
+// threads doing ~1e11 rounds they all contended a single lock — the real reason
+// big models (ResNet18) took hours to build.
+static inline bool roundInGP8Table(double x, const GP8BuildTimeTable &table,
+                                   double &roundedOut,
+                                   uint64_t *rawOut = nullptr) {
+  if (!std::isfinite(x)) {
+    roundedOut = std::numeric_limits<double>::quiet_NaN();
+    if (rawOut)
+      *rawOut = 0x80u;
+    return true;
+  }
+  if (table.sorted.empty()) {
+    roundedOut = 0.0;
+    if (rawOut)
+      *rawOut = 0u;
+    return true;
+  }
+  auto it = std::lower_bound(
+      table.sorted.begin(), table.sorted.end(), x,
+      [](const std::pair<double, uint8_t> &a, double v) { return a.first < v; });
+  uint8_t raw = 0;
+  if (it == table.sorted.begin()) {
+    raw = it->second;
+  } else if (it == table.sorted.end()) {
+    raw = table.sorted.back().second;
+  } else {
+    auto prev = it - 1;
+    raw = (std::fabs(prev->first - x) <= std::fabs(it->first - x)) ? prev->second
+                                                                   : it->second;
+  }
+  roundedOut = table.decode[raw];
+  if (rawOut)
+    *rawOut = raw;
+  return true;
+}
+
+// Fetch the (cached) GP8 build-time table for a runtime es; returns nullptr for
+// unsupported es. Still locks the cache once — call it ONCE per (es,rs,sc), not
+// per element.
+static const GP8BuildTimeTable *getGP8BuildTimeTablePtr(unsigned es, int rs,
+                                                        int sc) {
+  switch (es) {
+  case 0:
+    return &getGP8BuildTimeTableCustom<0>(rs, sc);
+  case 1:
+    return &getGP8BuildTimeTableCustom<1>(rs, sc);
+  case 2:
+    return &getGP8BuildTimeTableCustom<2>(rs, sc);
+  default:
+    return nullptr;
+  }
+}
+
 static bool generalizedP8RoundToDoubleDispatch(double x, unsigned es, int rs,
                                                int sc, double &roundedOut,
                                                uint64_t *rawOut = nullptr) {
-  auto roundOne = [&](const auto &table) -> bool {
-    if (!std::isfinite(x)) {
-      roundedOut = std::numeric_limits<double>::quiet_NaN();
-      if (rawOut)
-        *rawOut = 0x80u;
-      return true;
-    }
-    if (table.sorted.empty()) {
-      roundedOut = 0.0;
-      if (rawOut)
-        *rawOut = 0u;
-      return true;
-    }
-    auto it = std::lower_bound(
-        table.sorted.begin(), table.sorted.end(), x,
-        [](const std::pair<double, uint8_t> &a, double v) {
-          return a.first < v;
-        });
-    uint8_t raw = 0;
-    if (it == table.sorted.begin()) {
-      raw = it->second;
-    } else if (it == table.sorted.end()) {
-      raw = table.sorted.back().second;
-    } else {
-      auto prev = it - 1;
-      raw = (std::fabs(prev->first - x) <= std::fabs(it->first - x))
-                ? prev->second
-                : it->second;
-    }
-    roundedOut = table.decode[raw];
-    if (rawOut)
-      *rawOut = raw;
-    return true;
-  };
-
-  switch (es) {
-  case 0:
-    return roundOne(getGP8BuildTimeTableCustom<0>(rs, sc));
-  case 1:
-    return roundOne(getGP8BuildTimeTableCustom<1>(rs, sc));
-  case 2:
-    return roundOne(getGP8BuildTimeTableCustom<2>(rs, sc));
-  default:
+  const GP8BuildTimeTable *table = getGP8BuildTimeTablePtr(es, rs, sc);
+  if (!table)
     return false;
-  }
+  return roundInGP8Table(x, *table, roundedOut, rawOut);
 }
 
 static double percentileAbsInPlace(SmallVectorImpl<double> &vals, double q) {
@@ -1327,12 +1343,15 @@ buildTimeWeightAlpsDecision(ArrayRef<double> vals, unsigned nbits,
     SmallVector<double, 8> directDecoded;
     directDecoded.reserve(scoreVals.size());
     bool directBad = false;
+    // Table fetched once per config (not per weight) — same lock-free round.
+    const GP8BuildTimeTable *gpTabD =
+        cfg.enabled ? getGP8BuildTimeTablePtr(es, cfg.rs, cfg.sc) : nullptr;
     for (double v : scoreVals) {
       double rounded = v;
       uint64_t raw = 0;
       bool ok = cfg.enabled
-                    ? generalizedP8RoundToDoubleDispatch(
-                          v, es, cfg.rs, cfg.sc, rounded, &raw)
+                    ? (gpTabD ? roundInGP8Table(v, *gpTabD, rounded, &raw)
+                              : false)
                     : universalRoundToDoubleDispatch(
                           v, nbits, es, rounded, &raw);
       if (!ok) {
@@ -1386,6 +1405,12 @@ buildTimeWeightAlpsDecision(ArrayRef<double> vals, unsigned nbits,
     if (!(gammaBase > 0.0) || !std::isfinite(gammaBase))
       return;
 
+    // Fetch the GP8 round table ONCE per candidate (rs,sc are fixed for this
+    // task) so the per-weight round below is a lock-free binary search instead
+    // of re-locking the table cache on every element.
+    const GP8BuildTimeTable *gpTab =
+        cfg.enabled ? getGP8BuildTimeTablePtr(es, cfg.rs, cfg.sc) : nullptr;
+
     SmallVector<double, 8> localDecoded;
     for (double gammaScale : gammaScales) {
       double gamma = gammaBase * gammaScale;
@@ -1398,8 +1423,7 @@ buildTimeWeightAlpsDecision(ArrayRef<double> vals, unsigned nbits,
         double y = std::asinh(theta * v) / gamma;
         double yq = y;
         bool ok = cfg.enabled
-                      ? generalizedP8RoundToDoubleDispatch(
-                            y, es, cfg.rs, cfg.sc, yq, nullptr)
+                      ? (gpTab ? roundInGP8Table(y, *gpTab, yq, nullptr) : false)
                       : universalRoundToDoubleDispatch(
                             y, nbits, es, yq, nullptr);
         if (!ok) {

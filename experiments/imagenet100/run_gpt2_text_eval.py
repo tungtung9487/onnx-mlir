@@ -357,10 +357,12 @@ def run_generate(
     attention_mask = np.ones((1, total_len), dtype=np.int64)
     position_ids = np.arange(total_len, dtype=np.int64)[None, :]
 
+    t0 = time.time()
     out = runner.step(input_ids, past, attention_mask, position_ids)
     past = out.past
     generated = []
     step_top1 = []
+    nll = 0.0  # model's self-NLL over the tokens it generates (greedy)
 
     for _ in range(max_new_tokens):
         last = out.logits[0, -1]
@@ -368,6 +370,7 @@ def run_generate(
         step_top1.append(next_id)
         if next_id == tokenizer.eos_token_id:
             break
+        nll -= float(log_softmax(last)[next_id])
         generated.append(next_id)
         input_ids = np.array([[next_id]], dtype=np.int64)
         total_len += 1
@@ -376,6 +379,9 @@ def run_generate(
         out = runner.step(input_ids, past, attention_mask, position_ids)
         past = out.past
 
+    elapsed = time.time() - t0
+    n_gen = len(generated)
+    avg_nll = (nll / n_gen) if n_gen else 0.0
     return {
         "prompt_ids": prompt_ids,
         "generated_ids": generated,
@@ -383,6 +389,11 @@ def run_generate(
         "generated_text": tokenizer.decode(generated),
         "full_text": tokenizer.decode(prompt_ids + generated),
         "first_top1": step_top1[0] if step_top1 else None,
+        "num_generated": n_gen,
+        "gen_avg_nll": avg_nll,
+        "gen_ppl": math.exp(avg_nll) if n_gen else float("nan"),
+        "elapsed_sec": elapsed,
+        "tokens_per_sec": (n_gen / elapsed) if elapsed > 0 else 0.0,
     }
 
 
@@ -405,6 +416,7 @@ def score_token_ids(runner, token_ids: list[int],
     exact = 0
     compared = 0
     first_pred = None
+    pred_ids: list[int] = []  # model's greedy next-token prediction at each step
     to_predict = len(token_ids) - 1
     t0 = time.time()
 
@@ -413,6 +425,7 @@ def score_token_ids(runner, token_ids: list[int],
         past = out.past
         last = out.logits[0, -1]
         pred = int(np.argmax(last))
+        pred_ids.append(pred)
         if first_pred is None:
             first_pred = pred
         exact += int(pred == target)
@@ -444,6 +457,7 @@ def score_token_ids(runner, token_ids: list[int],
         "exact": exact,
         "compared": compared,
         "first_pred": first_pred,
+        "pred_ids": pred_ids,
         "elapsed_sec": elapsed,
         "tokens_per_sec": (compared / elapsed) if elapsed > 0 else 0.0,
     }
@@ -470,6 +484,9 @@ def run_score(runner, tokenizer: GPT2BPETokenizer, text: str,
         "next_token_top1_acc": s["exact"] / s["compared"],
         "first_pred_token_id": s["first_pred"],
         "text_preview": tokenizer.decode(token_ids[: min(48, len(token_ids))]),
+        # what GPT-2 predicts as the continuation (greedy next-token at each
+        # position, decoded back to text).
+        "predicted_text": tokenizer.decode(s["pred_ids"]),
         "elapsed_sec": s["elapsed_sec"],
         "tokens_per_sec": s["tokens_per_sec"],
     }
@@ -512,15 +529,50 @@ def main() -> int:
     runner = build_runner(args.model)
 
     if args.mode == "generate":
-        result = run_generate(runner, tokenizer, args.prompt, args.max_new_tokens)
-        print("mode generate")
-        print("model", args.model)
-        print("prompt_ids", result["prompt_ids"])
-        print("generated_ids", result["generated_ids"])
-        print("prompt_text", repr(result["prompt_text"]))
-        print("generated_text", repr(result["generated_text"]))
-        print("full_text", repr(result["full_text"]))
-        print("first_top1", result["first_top1"])
+        # Seed: use --text-file's first 48 tokens if given, else --prompt.
+        if args.text_file:
+            with open(args.text_file, "r", encoding="utf-8") as _f:
+                seed_ids = tokenizer.encode(_f.read())[:48]
+            prompt = tokenizer.decode(seed_ids) if seed_ids else args.prompt
+        else:
+            prompt = args.prompt
+        result = run_generate(runner, tokenizer, prompt, args.max_new_tokens)
+        gsummary = [
+            ("mode", "generate"),
+            ("model", os.path.basename(args.model)),
+            ("format", _guess_format_tag(args.model)),
+            ("max_new_tokens", args.max_new_tokens),
+            ("num_generated", result["num_generated"]),
+            # self-perplexity: model's confidence in its own greedy output
+            # (NOT teacher-forced ppl on ground-truth text).
+            ("gen_ppl", f"{result['gen_ppl']:.6f}"),
+            ("gen_avg_nll", f"{result['gen_avg_nll']:.6f}"),
+            ("elapsed_sec", f"{result['elapsed_sec']:.2f}"),
+            ("tokens_per_sec", f"{result['tokens_per_sec']:.3f}"),
+            ("first_top1_token_id", result["first_top1"]),
+            ("omp_threads", os.environ.get("POSIT_OMP_THREADS", "")),
+            ("seed_from", os.path.basename(args.text_file) if args.text_file
+                          else "--prompt"),
+        ]
+        for k, v in gsummary:
+            print(f"{k}={v}")
+        print("\n# prompt_text (seed)")
+        print(result["prompt_text"])
+        print("\n# generated_text (GPT-2 free continuation)")
+        print(result["generated_text"])
+        if args.results_log.lower() != "off":
+            model_dir = os.path.dirname(os.path.abspath(args.model))
+            summary_path = os.path.join(
+                model_dir, f"{Path(args.model).stem}.generate_summary.log")
+            with open(summary_path, "w", encoding="utf-8") as f:
+                f.write("# gpt2 generate summary\n")
+                for k, v in gsummary:
+                    f.write(f"{k}={v}\n")
+                f.write("\n# prompt_text (seed)\n")
+                f.write(result["prompt_text"] + "\n")
+                f.write("\n# generated_text (GPT-2 free continuation)\n")
+                f.write(result["generated_text"] + "\n")
+            print(f"summary_file={summary_path}")
         return 0
 
     if args.text_file:
@@ -530,25 +582,52 @@ def main() -> int:
         text = args.text if args.text else args.prompt
     result = run_score(runner, tokenizer, text, max_tokens=args.max_tokens,
                        progress=args.progress)
-    print("mode score")
-    print("model", args.model)
-    print("num_tokens", result["num_tokens"])
-    print("num_predicted", result["num_predicted"])
-    print("avg_nll", result["avg_nll"])
-    print("ppl", result["ppl"])
-    print("next_token_top1_acc", result["next_token_top1_acc"])
-    print("first_pred_token_id", result["first_pred_token_id"])
-    print("text_preview", repr(result["text_preview"]))
-    print("elapsed_sec", round(result["elapsed_sec"], 2))
-    print("tokens_per_sec", round(result["tokens_per_sec"], 3))
+    fmt = _guess_format_tag(args.model)
+    # One metric per line, key=value (build_posit_config.log style).
+    summary = [
+        ("mode", "score"),
+        ("model", os.path.basename(args.model)),
+        ("format", fmt),
+        ("num_tokens", result["num_tokens"]),
+        ("num_predicted", result["num_predicted"]),
+        ("avg_nll", f"{result['avg_nll']:.6f}"),
+        ("ppl", f"{result['ppl']:.6f}"),
+        ("next_token_top1_acc", f"{result['next_token_top1_acc']:.6f}"),
+        ("first_pred_token_id", result["first_pred_token_id"]),
+        ("elapsed_sec", f"{result['elapsed_sec']:.2f}"),
+        ("tokens_per_sec", f"{result['tokens_per_sec']:.3f}"),
+        ("omp_threads", os.environ.get("POSIT_OMP_THREADS", "")),
+        ("max_tokens", args.max_tokens),
+        ("text_file", os.path.basename(args.text_file) if args.text_file else ""),
+    ]
+    for k, v in summary:
+        print(f"{k}={v}")
+    # The passage GPT-2 predicts as the continuation (greedy next-token, decoded).
+    print("\n# input_text_preview (first 48 tokens)")
+    print(result["text_preview"])
+    print("\n# predicted_text (GPT-2 greedy next-token continuation)")
+    print(result["predicted_text"])
 
     # Record the run (ppl / top1 / timing) like the CNN runner does.
     if args.results_log.lower() != "off":
-        fmt = _guess_format_tag(args.model)
+        model_dir = os.path.dirname(os.path.abspath(args.model))
+        # (a) per-run vertical key=value summary file, one per format
+        #     (exactly build_posit_config.log style; overwritten each run).
+        summary_path = os.path.join(
+            model_dir, f"{Path(args.model).stem}.score_summary.log")
+        with open(summary_path, "w", encoding="utf-8") as f:
+            f.write("# gpt2 score summary\n")
+            for k, v in summary:
+                f.write(f"{k}={v}\n")
+            f.write("\n# input_text_preview (first 48 tokens)\n")
+            f.write(result["text_preview"] + "\n")
+            f.write("\n# predicted_text (GPT-2 greedy next-token continuation)\n")
+            f.write(result["predicted_text"] + "\n")
+        print(f"summary_file={summary_path}")
+        # (b) shared TSV so multiple formats (f32/int8/p8/p16/p32) stay comparable.
         results_log = args.results_log or os.path.join(
-            os.path.dirname(os.path.abspath(args.model)),
-            "gpt2_text_eval_results.tsv")
-        row = {
+            model_dir, "gpt2_text_eval_results.tsv")
+        append_result_row(results_log, {
             "ts_iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "tag": args.tag or fmt,
             "model": os.path.basename(args.model),
@@ -564,9 +643,8 @@ def main() -> int:
             "omp_threads": os.environ.get("POSIT_OMP_THREADS", ""),
             "max_tokens": args.max_tokens,
             "text_file": os.path.basename(args.text_file) if args.text_file else "",
-        }
-        append_result_row(results_log, row)
-        print("results_log", results_log)
+        })
+        print(f"results_log={results_log}")
     return 0
 
 

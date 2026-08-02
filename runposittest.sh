@@ -415,7 +415,7 @@ GPT-2
 build
 POSIT_FORMATS=p8e1,p16e1,p32e1 \
 bash /home/lai/onnx_mlir/onnx-mlir/src/bash/build_gpt2_hf_11_sos.sh \
-  build_gpt2_nqdq_p8e1 --posit-source nqdq --runtime-format-scope single \
+  build_gpt2_nqdq_p8e1 --posit-source nqdq --posit-formats p8e0,p8e1,p8e2 --runtime-format-scope single \
   --runtime-qalign-mode full --runtime-mixed-accum off --runtime-output-alps off
 
 runtime

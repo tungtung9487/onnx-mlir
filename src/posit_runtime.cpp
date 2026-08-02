@@ -40,6 +40,7 @@ extern "C" {
 #include "mlir/ExecutionEngine/CRunnerUtils.h"
 
 #include <atomic>
+#include <chrono>
 #include <algorithm>
 #include <array>
 #include <random>
@@ -73,6 +74,37 @@ static std::atomic<uint64_t> gPositQuireFallbackCount{0};
 static std::atomic<uint64_t> gPositOpAlignFallbackCount{0};
 static std::atomic<uint64_t> gPositMixedP16FallbackCount{0};
 static std::atomic<uint64_t> gPositFallbackLogSeq{0};
+
+// Coarse per-stage wall-time profiler (POSIT_PROFILE=1). Splits a forward pass
+// into: conv weight/input decode+decompand (the posit->value step, incl. ALPS
+// sinh), conv MAC (the fma inner loops), and gemm. Zero overhead when off.
+static inline bool positProfileEnabled() {
+  static int e = -1;
+  if (e < 0) {
+    const char *v = std::getenv("POSIT_PROFILE");
+    e = (v && *v && std::string(v) != "0" && std::string(v) != "off") ? 1 : 0;
+  }
+  return e == 1;
+}
+static inline long long positNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+static std::atomic<long long> gProfConvDecodeNs{0};
+static std::atomic<long long> gProfConvMacNs{0};
+static std::atomic<long long> gProfGemmNs{0};
+struct PositProfileDump {
+  ~PositProfileDump() {
+    if (!positProfileEnabled())
+      return;
+    std::fprintf(stderr,
+                 "[POSIT_PROFILE] conv_decode=%.3fs conv_mac=%.3fs gemm=%.3fs\n",
+                 gProfConvDecodeNs.load() / 1e9, gProfConvMacNs.load() / 1e9,
+                 gProfGemmNs.load() / 1e9);
+  }
+};
+static PositProfileDump gPositProfileDump;
 
 struct QAlignBucketKey {
   int64_t key;
@@ -2917,6 +2949,24 @@ static inline typename Fmt::UIntT bits_from_double_fmt(double x) {
 
 template <typename Fmt>
 static inline double double_from_bits_fmt(typename Fmt::UIntT b) {
+  // Speedup for 8-bit posit (p8e0/e1/e2): the raw->value decode has only 256
+  // possible inputs, so precompute a lookup table once and index it instead of
+  // calling the Universal library's fromRaw/toDouble on every element. The LUT
+  // is filled from the exact same Fmt::toDouble(Fmt::fromRaw(i)) => bit-identical
+  // to the direct call; it only removes the per-decode library-call cost. This is
+  // the single decode entry point used by conv/gemm (and the plain/ALPS-yq
+  // decode), so tabulating here accelerates every 8-bit decode path. Thread-safe:
+  // C++ guarantees the function-local static is initialized exactly once.
+  if constexpr (sizeof(typename Fmt::UIntT) == 1) {
+    static const std::array<double, 256> lut = [] {
+      std::array<double, 256> t{};
+      for (int i = 0; i < 256; ++i)
+        t[static_cast<size_t>(i)] =
+            Fmt::toDouble(Fmt::fromRaw(static_cast<typename Fmt::UIntT>(i)));
+      return t;
+    }();
+    return lut[static_cast<uint8_t>(b)];
+  }
   return Fmt::toDouble(Fmt::fromRaw(b));
 }
 
@@ -5300,8 +5350,8 @@ static void elemwise_kernel(ElemwiseOpKind opKind,
       }
       continue;
     }
-    double av = Fmt::toDouble(Fmt::fromRaw(abit));
-    double bv = Fmt::toDouble(Fmt::fromRaw(bbit));
+    double av = double_from_bits_fmt<Fmt>(abit);
+    double bv = double_from_bits_fmt<Fmt>(bbit);
     auto pa = Fmt::fromRaw(abit);
     auto pb = Fmt::fromRaw(bbit);
     typename Fmt::PositT pc = pa;
@@ -5449,7 +5499,7 @@ static const float *getDecodedF32(const typename Fmt::MemT *data, int64_t offset
   e.f32.resize(static_cast<size_t>(elems));
   for (int64_t t = 0; t < elems; ++t)
     e.f32[static_cast<size_t>(t)] =
-        static_cast<float>(Fmt::toDouble(Fmt::fromRaw(data[offset + t])));
+        static_cast<float>(double_from_bits_fmt<Fmt>(data[offset + t]));
   return e.f32.data();
 }
 
@@ -5459,6 +5509,13 @@ static void gemm_kernel(UnrankedMemRefType<typename Fmt::MemT> *A,
                         UnrankedMemRefType<typename Fmt::MemT> *C,
                         UnrankedMemRefType<typename Fmt::MemT> *Y, float alpha, float beta,
                         int64_t transA, int64_t transB, int64_t qalignKey) {
+  struct GemmProfScope {
+    long long t0;
+    ~GemmProfScope() {
+      if (positProfileEnabled())
+        gProfGemmNs += positNowNs() - t0;
+    }
+  } _gemmProf{positProfileEnabled() ? positNowNs() : 0};
   DynamicMemRefType<typename Fmt::MemT> a(*A), b(*B), c(*C), y(*Y);
   const void *aMetaPtr = tensorMetaPtr(a);
   const void *bMetaPtr = tensorMetaPtr(b);
@@ -5579,7 +5636,7 @@ static void gemm_kernel(UnrankedMemRefType<typename Fmt::MemT> *A,
         aF32.resize(static_cast<size_t>(batch * M * K));
         for (int64_t t = 0; t < batch * M * K; ++t)
           aF32[static_cast<size_t>(t)] = static_cast<float>(
-              Fmt::toDouble(Fmt::fromRaw(a.data[a.offset + t])));
+              double_from_bits_fmt<Fmt>(a.data[a.offset + t]));
         aF32p = aF32.data();
       }
       // (c) decoded-weight cache: only for a shared 2D weight B (e.g. lm_head);
@@ -5661,6 +5718,13 @@ static void gemm_kernel(UnrankedMemRefType<typename Fmt::MemT> *A,
       bool quireForProbe = (!metaPathForProbe) && (!f32ForProbe) && (!p16ForProbe) && dotAccumulatorWouldUseQuire<Fmt>();
       std::string modeForProbe = metaPathForProbe ? (useMetaF32 ? "gp_metadata_f32" : "gp_metadata_f64") : (f32ForProbe ? "f32" : (p16ForProbe ? positBuildMixedModeName() : (quireForProbe ? "quire" : "posit_acc")));
       recordDotProbe<Fmt>("gemm3d", qalignKey, modeForProbe, quireForProbe, f32ForProbe, p16ForProbe, metaPathForProbe, N, M, S, 0, K, N * M * S);
+      if (positProfileEnabled()) {
+        static std::atomic<int> _gp{0};
+        if (_gp.fetch_add(1) < 3)
+          std::fprintf(stderr, "[GEMM3D-PATH] mode=%s M=%lld N=%lld K=%lld S=%lld\n",
+                       modeForProbe.c_str(), (long long)M, (long long)N,
+                       (long long)K, (long long)S);
+      }
     }
 
     if (useMetaPath) {
@@ -5670,8 +5734,35 @@ static void gemm_kernel(UnrankedMemRefType<typename Fmt::MemT> *A,
         std::vector<double> deferredValues;
         if (useRuntimeOutputAlps)
           deferredValues.resize(static_cast<size_t>(N * M * S));
+        // Speedup (the 1x1 pointwise-conv path — the bulk of MobileNetV2's MACs):
+        // the per-channel metadata of A depends only on m and B only on n, and the
+        // naive loop re-decoded a[m,k] once per output pixel s (S times) and
+        // b[n,k,s] once per output channel m (M times), each with a mutex-locked
+        // metadata lookup PER multiply-accumulate. Hoist the two lookups out and
+        // pre-decode A (M*K) and B (N*K*S) ONCE; the inner loop becomes a plain
+        // fma. Removes O(N*M*S*K) locks + redundant posit-decode/ALPS-decompand.
+        // Bit-identical: same float decode values, same fma order over k.
+        std::vector<float> aF32(static_cast<size_t>(M) * K);
+        for (int64_t m = 0; m < M; ++m) {
+          TensorGPMetadata aMetaCh =
+              lookupTensorGPMetadataForChannel(aMetaPtr, m, aMeta);
+          for (int64_t k = 0; k < K; ++k)
+            aF32[static_cast<size_t>(m) * K + k] = static_cast<float>(
+                decodeTensorValue<Fmt>(load2(a, m, k), aMetaCh));
+        }
+        std::vector<float> bF32(static_cast<size_t>(N) * K * S);
+        for (int64_t n = 0; n < N; ++n) {
+          TensorGPMetadata bMetaCh =
+              lookupTensorGPMetadataForChannel(bMetaPtr, n, bMeta);
+          for (int64_t k = 0; k < K; ++k)
+            for (int64_t s = 0; s < S; ++s)
+              bF32[(static_cast<size_t>(n) * K + k) * S + s] = static_cast<float>(
+                  decodeTensorValue<Fmt>(load3(b, n, k, s), bMetaCh));
+        }
+#pragma omp parallel for collapse(2) if(!samples.enabled && N * M >= 4) num_threads(positOmpThreadCount()) schedule(static)
         for (int64_t n = 0; n < N; ++n) {
           for (int64_t m = 0; m < M; ++m) {
+            const float *aRow = &aF32[static_cast<size_t>(m) * K];
             for (int64_t s = 0; s < S; ++s) {
               int64_t idx3[3] = {n, m, s};
               TensorGPMetadata cMetaCh =
@@ -5681,17 +5772,9 @@ static void gemm_kernel(UnrankedMemRefType<typename Fmt::MemT> *A,
               float cF = static_cast<float>(
                   decodeTensorValue<Fmt>(load_broadcast_nd(c, idx3, 3), cMetaCh));
               float dot = 0.0f;
-              for (int64_t k = 0; k < K; ++k) {
-                TensorGPMetadata aMetaCh =
-                    lookupTensorGPMetadataForChannel(aMetaPtr, m, aMeta);
-                TensorGPMetadata bMetaCh =
-                    lookupTensorGPMetadataForChannel(bMetaPtr, n, bMeta);
-                float av = static_cast<float>(
-                    decodeTensorValue<Fmt>(load2(a, m, k), aMetaCh));
-                float bv = static_cast<float>(
-                    decodeTensorValue<Fmt>(load3(b, n, k, s), bMetaCh));
-                dot = std::fma(av, bv, dot);
-              }
+              for (int64_t k = 0; k < K; ++k)
+                dot = std::fma(aRow[k],
+                               bF32[(static_cast<size_t>(n) * K + k) * S + s], dot);
               float yF = std::fma(dot, alphaF, betaF * cF);
               int64_t lin = (n * M + m) * S + s;
               if (useRuntimeOutputAlps) {
@@ -5725,8 +5808,34 @@ static void gemm_kernel(UnrankedMemRefType<typename Fmt::MemT> *A,
         std::vector<double> deferredValues;
         if (useRuntimeOutputAlps)
           deferredValues.resize(static_cast<size_t>(N * M * S));
+        // Speedup (gp_metadata_f64 path — the branch MobileNetV2's 1x1 pointwise
+        // convs actually take): hoist the per-channel metadata lookups (A depends
+        // only on m, B only on n) out of the per-MAC inner loop, and pre-decode A
+        // (M*K) and B (N*K*S) ONCE instead of re-decoding a[m,k] for every s and
+        // b[n,k,s] for every m with a mutex-locked lookup per multiply-accumulate.
+        // Inner loop becomes a plain fma. Bit-identical (same double decode values,
+        // same fma order over k).
+        std::vector<double> aDec(static_cast<size_t>(M) * K);
+        for (int64_t m = 0; m < M; ++m) {
+          TensorGPMetadata aMetaCh =
+              lookupTensorGPMetadataForChannel(aMetaPtr, m, aMeta);
+          for (int64_t k = 0; k < K; ++k)
+            aDec[static_cast<size_t>(m) * K + k] =
+                decodeTensorValue<Fmt>(load2(a, m, k), aMetaCh);
+        }
+        std::vector<double> bDec(static_cast<size_t>(N) * K * S);
+        for (int64_t n = 0; n < N; ++n) {
+          TensorGPMetadata bMetaCh =
+              lookupTensorGPMetadataForChannel(bMetaPtr, n, bMeta);
+          for (int64_t k = 0; k < K; ++k)
+            for (int64_t s = 0; s < S; ++s)
+              bDec[(static_cast<size_t>(n) * K + k) * S + s] =
+                  decodeTensorValue<Fmt>(load3(b, n, k, s), bMetaCh);
+        }
+#pragma omp parallel for collapse(2) if(!samples.enabled && N * M >= 4) num_threads(positOmpThreadCount()) schedule(static)
         for (int64_t n = 0; n < N; ++n) {
           for (int64_t m = 0; m < M; ++m) {
+            const double *aRow = &aDec[static_cast<size_t>(m) * K];
             for (int64_t s = 0; s < S; ++s) {
               int64_t idx3[3] = {n, m, s};
               TensorGPMetadata cMetaCh =
@@ -5736,15 +5845,9 @@ static void gemm_kernel(UnrankedMemRefType<typename Fmt::MemT> *A,
               double cD =
                   decodeTensorValue<Fmt>(load_broadcast_nd(c, idx3, 3), cMetaCh);
               double dot = 0.0;
-              for (int64_t k = 0; k < K; ++k) {
-                TensorGPMetadata aMetaCh =
-                    lookupTensorGPMetadataForChannel(aMetaPtr, m, aMeta);
-                TensorGPMetadata bMetaCh =
-                    lookupTensorGPMetadataForChannel(bMetaPtr, n, bMeta);
-                double av = decodeTensorValue<Fmt>(load2(a, m, k), aMetaCh);
-                double bv = decodeTensorValue<Fmt>(load3(b, n, k, s), bMetaCh);
-                dot = std::fma(av, bv, dot);
-              }
+              for (int64_t k = 0; k < K; ++k)
+                dot = std::fma(aRow[k],
+                               bDec[(static_cast<size_t>(n) * K + k) * S + s], dot);
               double yD = std::fma(dot, alphaD, betaD * cD);
               int64_t lin = (n * M + m) * S + s;
               if (useRuntimeOutputAlps) {
@@ -5804,9 +5907,9 @@ static void gemm_kernel(UnrankedMemRefType<typename Fmt::MemT> *A,
               float dotF = 0.0f;
               for (int64_t k = 0; k < K; ++k) {
                 float av =
-                    static_cast<float>(Fmt::toDouble(Fmt::fromRaw(load2(a, m, k))));
+                    static_cast<float>(double_from_bits_fmt<Fmt>(load2(a, m, k)));
                 float bv =
-                    static_cast<float>(Fmt::toDouble(Fmt::fromRaw(load3(b, n, k, s))));
+                    static_cast<float>(double_from_bits_fmt<Fmt>(load3(b, n, k, s)));
                 dotF = std::fma(av, bv, dotF);
               }
               float cF = static_cast<float>(Fmt::toDouble(Fmt::fromRaw(cbit)));
@@ -6046,8 +6149,8 @@ static void gemm_kernel(UnrankedMemRefType<typename Fmt::MemT> *A,
             float bv = bF32cg
                            ? (transB ? bF32cg[static_cast<size_t>(j) * K + k]
                                      : bF32cg[static_cast<size_t>(k) * N + j])
-                           : static_cast<float>(Fmt::toDouble(Fmt::fromRaw(
-                                 transB ? load2(b, j, k) : load2(b, k, j))));
+                           : static_cast<float>(double_from_bits_fmt<Fmt>(
+                                 transB ? load2(b, j, k) : load2(b, k, j)));
             dotF = std::fma(aF32gp[static_cast<size_t>(i) * K + k], bv, dotF);
           }
           float cF = static_cast<float>(Fmt::toDouble(Fmt::fromRaw(cbit)));
@@ -6184,10 +6287,12 @@ static void conv2d_nchw_kernel(UnrankedMemRefType<typename Fmt::MemT> *X,
   // channel (Mpg times; large for pointwise 1x1 convs). Pre-decode the whole
   // input tensor ONCE here so each pixel is decoded a single time. Bit-identical
   // to the per-pixel decode (same xMeta). Only for the metadata path.
+  const bool prof = positProfileEnabled();
   const int64_t Cin = x.sizes[1];
   std::vector<double> xDec;
   const double *xDecp = nullptr;
   if (useMetaPath) {
+    long long _td = prof ? positNowNs() : 0;
     xDec.resize(static_cast<size_t>(N) * Cin * H * Wd);
     for (int64_t n = 0; n < N; ++n)
       for (int64_t ic = 0; ic < Cin; ++ic)
@@ -6196,6 +6301,8 @@ static void conv2d_nchw_kernel(UnrankedMemRefType<typename Fmt::MemT> *X,
             xDec[(((static_cast<size_t>(n) * Cin + ic) * H + ih) * Wd) + iw] =
                 decodeTensorValue<Fmt>(load4(x, n, ic, ih, iw), xMeta);
     xDecp = xDec.data();
+    if (prof)
+      gProfConvDecodeNs += positNowNs() - _td;
   }
 
   for (int64_t n = 0; n < N; ++n) {
@@ -6212,6 +6319,7 @@ static void conv2d_nchw_kernel(UnrankedMemRefType<typename Fmt::MemT> *X,
         std::vector<double> wDoc;
         const double *wDocp = nullptr;
         if (useMetaPath) {
+          long long _tw = prof ? positNowNs() : 0;
           TensorGPMetadata wMetaChOc =
               lookupTensorGPMetadataForChannel(wMetaPtr, oc, wMeta);
           wDoc.resize(static_cast<size_t>(Cpg) * kH * kW);
@@ -6221,7 +6329,10 @@ static void conv2d_nchw_kernel(UnrankedMemRefType<typename Fmt::MemT> *X,
                 wDoc[(static_cast<size_t>(cc) * kH + kh) * kW + kw] =
                     decodeTensorValue<Fmt>(load4(w, oc, cc, kh, kw), wMetaChOc);
           wDocp = wDoc.data();
+          if (prof)
+            gProfConvDecodeNs += positNowNs() - _tw;
         }
+        long long _tmac = prof ? positNowNs() : 0;
         for (int64_t oh = 0; oh < outH; ++oh) {
           for (int64_t ow = 0; ow < outW; ++ow) {
             if (useMetaPath) {
@@ -6413,6 +6524,8 @@ static void conv2d_nchw_kernel(UnrankedMemRefType<typename Fmt::MemT> *X,
                                 double_from_bits_fmt<Fmt>(outBits));
           }
         }
+        if (prof)
+          gProfConvMacNs += positNowNs() - _tmac;
       }
     }
   }
