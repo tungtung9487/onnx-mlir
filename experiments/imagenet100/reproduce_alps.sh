@@ -10,7 +10,7 @@
 #   THETA_MIN=0.01  THETA_MAX=10  THETA_STEPS=60  FORMAT=p8e2
 set -euo pipefail
 
-WS="${WS:-$HOME/onnx_mlir}"
+WS="${WS:-$HOME/test_rebuild_project}"
 BRANCH="tungtung9487/posit-work-20260329"
 FORK_URL="https://github.com/tungtung9487/onnx-mlir.git"
 LLVM_COMMIT="113f01aa82d055410f22a9d03b3468fa68600589"
@@ -31,6 +31,9 @@ mkdir -p "$WS"
 # ---- 1. get code (download from GitHub) -----------------------------------
 phase "1. clone onnx-mlir fork + LLVM"
 [ -d "$om/.git" ]   || git clone -b "$BRANCH" "$FORK_URL" "$om"
+# third_party/* (onnx, pybind11, rapidcheck, stablehlo, benchmark) are submodules
+# that onnx-mlir needs to configure/build; init them (idempotent).
+git -C "$om" submodule update --init --recursive
 [ -d "$llvm/.git" ] || git clone https://github.com/llvm/llvm-project.git "$llvm"
 git -C "$llvm" rev-parse --verify -q "$LLVM_COMMIT^{commit}" >/dev/null 2>&1 || git -C "$llvm" fetch --all
 git -C "$llvm" checkout -q "$LLVM_COMMIT"
