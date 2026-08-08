@@ -67,10 +67,11 @@ phase "3. posit deps + onnx-mlir"
 # makes onnx-mlir's cmake fail with "softposit library not found".
 [ -f "$om/src/.deps/softposit-px1/libsoftposit.a" ] || bash "$om/src/bash/install_posit_deps.sh"
 if [ ! -x "$om/build/Release/bin/onnx-mlir-opt" ]; then
-  # A configure that ran before the posit deps were built caches SOFTPOSIT_LIBRARY
-  # empty (find_library result is sticky); clear the stale cache so it re-detects,
-  # and point SOFTPOSIT_LIBRARY at the lib explicitly to bypass find_library.
-  rm -f "$om/build/CMakeCache.txt"
+  # Start from a CLEAN build dir: an earlier configure that ran before the posit
+  # deps were built leaves an inconsistent cache/CMakeFiles (sticky
+  # SOFTPOSIT_LIBRARY, half-wired abseil/protobuf targets like
+  # absl::log_internal_check_op). Only clearing CMakeCache.txt is not enough.
+  rm -rf "$om/build"
   mkdir -p "$om/build"
   cmake -G Ninja -S "$om" -B "$om/build" \
     -DMLIR_DIR="$llvm/build/lib/cmake/mlir" \
