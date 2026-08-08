@@ -5,18 +5,21 @@
 # RUN:   bash reproduce_alps.sh          (NOT `bash *.md` — a .md is not a script)
 # Re-runnable: each phase is skipped if its output already exists.
 #
-# Tunables via env (with small defaults):
-#   WS=<workspace root>   EPOCHS=5   EVAL_LIMIT=500   COLLECT_LIMIT=50
-#   THETA_MIN=0.01  THETA_MAX=10  THETA_STEPS=60  FORMAT=p8e2
+# Tunables via env (defaults reproduce the original run: 30 epochs, int8 too):
+#   WS=<workspace root>   EPOCHS=30   EVAL_LIMIT=500   COLLECT_LIMIT=50
+#   VAL_LIMIT=500 (int8 calibration imgs)   SOURCE=both (nqdq+int8 | nqdq | qdq)
+#   THETA_MIN=0.01  THETA_MAX=10  THETA_STEPS=60  FORMAT=p8e2 (CSV ok: p8e0,p8e1,p8e2)
 set -euo pipefail
 
 WS="${WS:-$HOME/test_rebuild_project}"
 BRANCH="tungtung9487/posit-work-20260329"
 FORK_URL="https://github.com/tungtung9487/onnx-mlir.git"
 LLVM_COMMIT="113f01aa82d055410f22a9d03b3468fa68600589"
-EPOCHS="${EPOCHS:-5}"
+EPOCHS="${EPOCHS:-30}"          # original MobileNetV2 training used 30 epochs
 EVAL_LIMIT="${EVAL_LIMIT:-500}"
 COLLECT_LIMIT="${COLLECT_LIMIT:-50}"
+VAL_LIMIT="${VAL_LIMIT:-500}"   # int8 QDQ calibration images (original used 500)
+SOURCE="${SOURCE:-both}"        # both = build nqdq(ALPS) + qdq(int8); or nqdq / qdq
 THETA_MIN="${THETA_MIN:-0.01}"; THETA_MAX="${THETA_MAX:-10}"; THETA_STEPS="${THETA_STEPS:-60}"
 FORMAT="${FORMAT:-p8e2}"
 NP="$(nproc)"
@@ -59,7 +62,10 @@ fi
 
 # ---- 3. posit deps + build onnx-mlir --------------------------------------
 phase "3. posit deps + onnx-mlir"
-[ -d "$om/src/.deps/universal" ] || bash "$om/src/bash/install_posit_deps.sh"
+# Check the actual softposit LIBRARY (not just the universal dir): a partial
+# earlier run can leave universal/ present but libsoftposit.a missing, which
+# makes onnx-mlir's cmake fail with "softposit library not found".
+[ -f "$om/src/.deps/softposit-px1/libsoftposit.a" ] || bash "$om/src/bash/install_posit_deps.sh"
 if [ ! -x "$om/build/Release/bin/onnx-mlir-opt" ]; then
   mkdir -p "$om/build"
   cmake -G Ninja -S "$om" -B "$om/build" \
@@ -94,36 +100,49 @@ if [ ! -f "$in100/model/imagenet100_mobilenetv2.onnx" ]; then
     --onnx-out model/imagenet100_mobilenetv2.onnx
 fi
 
-# ---- 6. build posit .so with weight-ALPS (small params) -------------------
-# Call build_model11_sos.sh directly (nqdq path); pass the f32 onnx as both
-# --nqdq-onnx and --qdq-onnx so arg-validation passes (qdq is NOT lowered for
-# --posit-source nqdq), avoiding the int8/val_224_txt calibration step.
-phase "6. build MobileNetV2 posit .so + ALPS ($FORMAT, theta $THETA_MIN~$THETA_MAX)"
-so="$in100/$OUT/imagenet100_mobilenetv2-nqdq-$FORMAT.so"
-if [ ! -f "$so" ]; then
+# ---- 5b. int8 QDQ calibration set (needed when SOURCE builds qdq) ----------
+if [[ "$SOURCE" != "nqdq" ]]; then
+  phase "5b. int8 calibration set val_224_txt ($VAL_LIMIT imgs)"
+  if [ ! -d "$in100/val_224_txt" ] || [ -z "$(ls -A "$in100/val_224_txt" 2>/dev/null)" ]; then
+    "$py" gen_val_224_txt.py --data-root imagenet100_hf/validation \
+      --out-dir val_224_txt --limit "$VAL_LIMIT"
+  fi
+fi
+
+# ---- 6. build posit .so via the wrapper -----------------------------------
+# SOURCE=both -> builds nqdq (weight-ALPS) AND qdq (int8->posit); the wrapper
+# auto-generates the int8 QDQ onnx from val_224_txt when it is missing.
+phase "6. build MobileNetV2 posit .so ($FORMAT, source=$SOURCE, theta $THETA_MIN~$THETA_MAX)"
+if [ ! -f "$in100/$OUT/build_posit_config.log" ]; then
   env ONNX_MLIR_POSIT_CONST_ALPS=1 POSIT_CONST_ALPS_JOBS="$NP" \
     ONNX_MLIR_POSIT_CONST_ALPS_THETA_MIN="$THETA_MIN" ONNX_MLIR_POSIT_CONST_ALPS_THETA_MAX="$THETA_MAX" \
     ONNX_MLIR_POSIT_CONST_ALPS_THETA_STEPS="$THETA_STEPS" ONNX_MLIR_POSIT_CONST_ALPS_GAMMA_TARGET=1.0 \
     ONNX_MLIR_POSIT_CONST_ALPS_GAMMA_PERCENTILE=0.99 ONNX_MLIR_POSIT_CONST_ALPS_MIN_GAIN=0.001 \
     ONNX_MLIR_POSIT_CONST_ALPS_MAX_SAMPLES=1024 \
     POSIT_GP_EXPERIMENTAL_FORMATS="$FORMAT" POSIT_GP_RS_VALUES_P8=7,5,3 POSIT_GP_SC_VALUES_P8=3,0,-3 \
-    POSIT_FORMATS="$FORMAT" INCLUDE_F32_BASELINES=1 \
-    bash "$om/src/bash/build_model11_sos.sh" \
-      --model-name imagenet100_mobilenetv2 \
-      --nqdq-onnx "$in100/model/imagenet100_mobilenetv2.onnx" \
-      --qdq-onnx  "$in100/model/imagenet100_mobilenetv2.onnx" \
-      --backend universal --out-dir "$in100/$OUT" \
-      --posit-source nqdq --runtime-format-scope single --runtime-qalign-mode alps-only \
-      --runtime-mixed-accum off --runtime-output-alps offline
+    POSIT_FORMATS="$FORMAT" INCLUDE_F32_BASELINES=1 ONNX_MLIR_ROOT="$om" \
+    bash "$in100/build_imagenet100_mobilenetv2_11_sos.sh" "$in100/$OUT" \
+      --posit-source "$SOURCE" --posit-formats "$FORMAT" --runtime-format-scope single \
+      --runtime-qalign-mode alps-only --runtime-mixed-accum off --runtime-output-alps offline
 fi
 
 # ---- 7. eval + offline output/activation-ALPS -----------------------------
 phase "7. eval ($EVAL_LIMIT imgs) + offline output-ALPS (collect $COLLECT_LIMIT)"
+# suffixes cover every built source x format (e.g. nqdq-p8e2,qdq-p8e2)
+suffixes=""
+for f in ${FORMAT//,/ }; do
+  case "$SOURCE" in
+    nqdq) suffixes+="nqdq-$f,";;
+    qdq)  suffixes+="qdq-$f,";;
+    both) suffixes+="nqdq-$f,qdq-$f,";;
+  esac
+done
+suffixes="${suffixes%,}"
 bash "$om/src/bash/time_model11_dataset_parallel.sh" \
   --model-name imagenet100_mobilenetv2 --out-dir "$in100/$OUT" \
   --image-dir "$in100/imagenet100_hf/validation" \
   --image-preprocess-script "$in100/preprocess_imagenet100_tensor.py" \
-  --shape 1x3x224x224 --suffixes "nqdq-$FORMAT" \
+  --shape 1x3x224x224 --suffixes "$suffixes" \
   --baseline none --qalign-auto off --qalign-mode off \
   --jobs "$NP" --limit "$EVAL_LIMIT" --warmup 0 --iters 1 --no-benchmark --quire off \
   --output-alps-auto on --output-alps-formats "$FORMAT" \
