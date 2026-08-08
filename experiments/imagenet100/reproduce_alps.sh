@@ -39,12 +39,21 @@ git -C "$llvm" rev-parse --verify -q "$LLVM_COMMIT^{commit}" >/dev/null 2>&1 || 
 git -C "$llvm" checkout -q "$LLVM_COMMIT"
 
 # ---- 2. build LLVM/MLIR (slow; skipped if already built) ------------------
+# Memory-safe: LLVM linking uses ~2-4GB per job; a full -j(nproc) build on a
+# RAM-limited box swap-thrashes and FREEZES the machine. Cap concurrent compiles
+# by RAM (~1 per 2GB) and concurrent LINKS to 2, and use lld if available.
 phase "2. build LLVM/MLIR"
 if [ ! -x "$llvm/build/bin/mlir-opt" ]; then
+  RAMGB="$(free -g | awk 'NR==2{print $2}')"
+  CJ=$(( RAMGB / 2 )); [ "$CJ" -lt 1 ] && CJ=1; [ "$CJ" -gt "$NP" ] && CJ="$NP"
+  llvm_extra=(-DLLVM_PARALLEL_COMPILE_JOBS="$CJ" -DLLVM_PARALLEL_LINK_JOBS=2)
+  command -v ld.lld >/dev/null 2>&1 && llvm_extra+=(-DLLVM_ENABLE_LLD=ON)
+  echo "  RAM=${RAMGB}GB nproc=${NP} -> compile_jobs=${CJ}, link_jobs=2$(command -v ld.lld >/dev/null 2>&1 && echo ' (+lld)')"
   mkdir -p "$llvm/build"
   cmake -G Ninja -S "$llvm/llvm" -B "$llvm/build" \
     -DLLVM_ENABLE_PROJECTS=mlir -DLLVM_TARGETS_TO_BUILD=host \
-    -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_ASSERTIONS=ON -DLLVM_ENABLE_RTTI=ON
+    -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_ASSERTIONS=ON -DLLVM_ENABLE_RTTI=ON \
+    "${llvm_extra[@]}"
   cmake --build "$llvm/build" -- -j"$NP"
 fi
 
