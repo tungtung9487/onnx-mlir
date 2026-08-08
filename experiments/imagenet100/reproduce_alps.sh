@@ -26,6 +26,7 @@ NP="$(nproc)"
 OUT="build_mbv2_alps_quick"
 
 om="$WS/onnx-mlir"; llvm="$WS/llvm-project"; in100="$WS/ImageNet100"
+absl="$WS/local-absl"
 py="$in100/venv/bin/python"; pip="$in100/venv/bin/pip"
 phase(){ echo; echo "==================== $* ===================="; }
 
@@ -61,11 +62,23 @@ if [ ! -x "$llvm/build/bin/mlir-opt" ]; then
 fi
 
 # ---- 3. posit deps + build onnx-mlir --------------------------------------
-phase "3. posit deps + onnx-mlir"
+phase "3. posit deps + abseil + onnx-mlir"
 # Check the actual softposit LIBRARY (not just the universal dir): a partial
 # earlier run can leave universal/ present but libsoftposit.a missing, which
 # makes onnx-mlir's cmake fail with "softposit library not found".
 [ -f "$om/src/.deps/softposit-px1/libsoftposit.a" ] || bash "$om/src/bash/install_posit_deps.sh"
+# onnx-mlir's onnx submodule needs a newer Abseil (>=20240722, which provides
+# absl::log_internal_check_op) than typical distro packages; build+install it
+# locally and point cmake at it (below) via CMAKE_PREFIX_PATH. Without this the
+# onnx-mlir configure fails with "target absl::log_internal_check_op not found".
+if [ ! -d "$absl/lib/cmake/absl" ]; then
+  [ -d "$WS/abseil-cpp/.git" ] || git clone -q -b 20240722.1 https://github.com/abseil/abseil-cpp.git "$WS/abseil-cpp"
+  cmake -G Ninja -S "$WS/abseil-cpp" -B "$WS/abseil-cpp/build" \
+    -DCMAKE_BUILD_TYPE=Release -DABSL_PROPAGATE_CXX_STD=ON -DABSL_ENABLE_INSTALL=ON \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DCMAKE_CXX_STANDARD=17 \
+    -DCMAKE_INSTALL_PREFIX="$absl"
+  cmake --build "$WS/abseil-cpp/build" --target install -- -j"$NP"
+fi
 if [ ! -x "$om/build/Release/bin/onnx-mlir-opt" ]; then
   # Start from a CLEAN build dir: an earlier configure that ran before the posit
   # deps were built leaves an inconsistent cache/CMakeFiles (sticky
@@ -77,7 +90,15 @@ if [ ! -x "$om/build/Release/bin/onnx-mlir-opt" ]; then
     -DMLIR_DIR="$llvm/build/lib/cmake/mlir" \
     -DLLVM_DIR="$llvm/build/lib/cmake/llvm" \
     -DCMAKE_BUILD_TYPE=Release \
-    -DSOFTPOSIT_LIBRARY="$om/src/.deps/softposit-px1/libsoftposit.a"
+    -DSOFTPOSIT_LIBRARY="$om/src/.deps/softposit-px1/libsoftposit.a" \
+    -DCMAKE_PREFIX_PATH="$absl"
+  # Generate the tablegen .inc headers FIRST: a direct `--target onnx-mlir-opt`
+  # build can try to compile a source before its generated header exists (e.g.
+  # src/Transform/Passes.h.inc) because onnx-mlir's per-target deps are
+  # incomplete. Build all *IncGen targets (-k 0, ignore benign parallel-rename
+  # hiccups), then the tools.
+  incgen="$(cd "$om/build" && ninja -t targets all 2>/dev/null | grep -oE 'OM[A-Za-z]*IncGen' | sort -u | tr '\n' ' ')"
+  [ -n "$incgen" ] && cmake --build "$om/build" --target $incgen -- -k 0 || true
   cmake --build "$om/build" --target onnx-mlir-opt onnx-mlir -- -j4
 fi
 
