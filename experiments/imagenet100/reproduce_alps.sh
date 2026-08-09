@@ -109,7 +109,7 @@ cp "$om/experiments/imagenet100/"*.py "$in100/" 2>/dev/null || true
 cp "$om/experiments/imagenet100/build_imagenet100_"*.sh "$in100/" 2>/dev/null || true
 if [ ! -x "$py" ]; then
   python3 -m venv "$in100/venv"; "$pip" install -U pip
-  "$pip" install torch torchvision timm datasets onnx onnxruntime numpy pillow
+  "$pip" install torch torchvision timm datasets onnx onnxruntime onnxscript numpy pillow
 fi
 
 # ---- 5. dataset + f32 model -----------------------------------------------
