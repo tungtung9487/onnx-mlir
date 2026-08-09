@@ -54,8 +54,12 @@ if [ ! -x "$llvm/build/bin/mlir-opt" ]; then
   command -v ld.lld >/dev/null 2>&1 && llvm_extra+=(-DLLVM_ENABLE_LLD=ON)
   echo "  RAM=${RAMGB}GB nproc=${NP} -> compile_jobs=${CJ}, link_jobs=2$(command -v ld.lld >/dev/null 2>&1 && echo ' (+lld)')"
   mkdir -p "$llvm/build"
+  # Need clang (to compile the model .ll -> .so; the build script's clang++ must
+  # match the LLVM IR version — a distro clang is too old for the new IR) and the
+  # openmp runtime (libomp, for -fopenmp linking of the .so).
   cmake -G Ninja -S "$llvm/llvm" -B "$llvm/build" \
-    -DLLVM_ENABLE_PROJECTS=mlir -DLLVM_TARGETS_TO_BUILD=host \
+    -DLLVM_ENABLE_PROJECTS="mlir;clang" -DLLVM_ENABLE_RUNTIMES="openmp" \
+    -DLLVM_TARGETS_TO_BUILD=host \
     -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_ASSERTIONS=ON -DLLVM_ENABLE_RTTI=ON \
     "${llvm_extra[@]}"
   cmake --build "$llvm/build" -- -j"$NP"
