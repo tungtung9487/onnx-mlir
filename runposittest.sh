@@ -497,3 +497,48 @@ bash /home/lai/onnx_mlir/onnx-mlir/src/bash/time_model11_dataset_parallel.sh
 跑之前先跑這兩行，路徑一樣要記得改： 
 cmake -G Ninja .. -DMLIR_DIR=/home/lai/mlir_toy/llvm-project/build/lib/cmake/mlir -DLLVM_DIR=/home/lai/mlir_toy/llvm-project/build/lib/cmake/llvm -DCMAKE_BUILD_TYPE=Release
 cmake --build /home/lai/onnx_mlir/onnx-mlir/build --target onnx-mlir-opt onnx-mlir -- -j4
+
+8/8
+改用一鍵編譯後：
+sudo apt-get update
+sudo apt-get install -y build-essential cmake ninja-build clang lld python3 python3-venv python3-pip git
+git clone -b tungtung9487/posit-work-20260329 https://github.com/tungtung9487/onnx-mlir.git
+bash onnx-mlir/experiments/imagenet100/reproduce_alps.sh
+unset WS
+WS=/home/lai/test_rebuild_project bash /home/lai/onnx_mlir/onnx-mlir/experiments/imagenet100/reproduce_alps.sh
+
+export WS=/home/lai/test_rebuild_project
+export om="$WS/onnx-mlir"
+export in100="$WS/ImageNet100"
+export py="$in100/venv/bin/python"
+cd "$in100"
+[ -d val_224_txt ] || "$py" gen_val_224_txt.py --data-root imagenet100_hf/validation --out-dir val_224_txt --limit 500
+
+POSIT_FORMATS=p8e0,p8e1,p8e2 INCLUDE_F32_BASELINES=1 \
+ONNX_MLIR_POSIT_CONST_ALPS=1 POSIT_CONST_ALPS_JOBS="$(nproc)" \
+ONNX_MLIR_POSIT_CONST_ALPS_THETA_MIN=0.0001 ONNX_MLIR_POSIT_CONST_ALPS_THETA_MAX=5 \
+ONNX_MLIR_POSIT_CONST_ALPS_THETA_STEPS=150 ONNX_MLIR_POSIT_CONST_ALPS_GAMMA_TARGET=1.0 \
+ONNX_MLIR_POSIT_CONST_ALPS_GAMMA_PERCENTILE=0.99 ONNX_MLIR_POSIT_CONST_ALPS_MIN_GAIN=0.001 \
+ONNX_MLIR_POSIT_CONST_ALPS_MAX_SAMPLES=0 \
+POSIT_GP_EXPERIMENTAL_FORMATS=p8e0,p8e1,p8e2 \
+POSIT_GP_RS_VALUES_P8=7,6,5,4,3 POSIT_GP_SC_VALUES_P8=3,2,1,0,-1,-2,-3 \
+ONNX_MLIR_ROOT="$om" \
+  bash "$in100/build_imagenet100_mobilenetv2_11_sos.sh" \
+    "$in100/build_posit11_mobilenetv2_alps_sqnr_p8_v2" \
+    --posit-source nqdq --posit-formats p8e0,p8e1,p8e2 --runtime-format-scope single \
+    --runtime-qalign-mode alps-only --runtime-mixed-accum off --runtime-output-alps offline
+
+
+POSIT_QOP_F32_MATH=on POSIT_QOP_F32_MATH_OPS=conv2d,gemm \
+  bash "$om/src/bash/time_model11_dataset_parallel.sh" \
+    --model-name imagenet100_mobilenetv2 \
+    --out-dir "$in100/build_posit11_mobilenetv2_alps_sqnr_p8_v2" \
+    --image-dir "$in100/imagenet100_hf/validation" \
+    --image-preprocess-script "$in100/preprocess_imagenet100_tensor.py" \
+    --shape 1x3x224x224 --suffixes nqdq-p8e0,nqdq-p8e2 \
+    --baseline none --qalign-auto off --qalign-mode off \
+    --jobs "$(nproc)" --limit 5000 --warmup 0 --iters 1 --no-benchmark --quire off \
+    --output-alps-auto on --output-alps-formats p8e0,p8e2 \
+    --output-alps-collect-limit 500 --output-alps-collect-jobs "$(nproc)" \
+    --record-preds on --progress 100 --task-progress on \
+    2>&1 | tee "$in100/build_posit11_mobilenetv2_alps_sqnr_p8_v2/mobilenetv2_alps_p8e2e0_offline_5000.log"
