@@ -1114,6 +1114,15 @@ if [[ "${output_alps_auto}" == "on" || -n "${output_alps_params_dir}" ]]; then
       if [[ -z "${active_suffix_by_name[${suffix}]:-}" ]]; then
         continue
       fi
+      # qdq/int8 posit path registers NO output-ALPS collect points (int8
+      # activations are governed by dequant scales, not posit output metadata),
+      # so collect would produce an empty CSV and hard-fail. Skip qdq for
+      # output-alps-auto with a warning; it is still evaluated, just without
+      # runtime output-ALPS. Only nqdq suffixes get output-ALPS.
+      if [[ "${prefix}" == "qdq" ]]; then
+        echo "WARN: output-alps-auto skips ${suffix} (qdq/int8 posit has no output-ALPS collect points); it runs without output-ALPS."
+        continue
+      fi
       params_root="${output_alps_params_dir:-${out_dir}/runtime_output_alps_auto/${model_name}}"
       fmt_dir="${params_root}/${suffix}"
       collect_count="${output_alps_collect_limit}"
